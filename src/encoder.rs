@@ -2095,23 +2095,23 @@ fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
 
 /// Exact §4.6.3.3 wire cost, in bits, of coding one band's
 /// coefficient range with spectrum book `cb` — Huffman codewords +
-/// sign bits + escape sequences, measured by running the actual
-/// [`crate::spectral_data`] tuple writer into a scratch buffer.
-/// `None` when the book cannot carry the band (a magnitude beyond
-/// the book's Table 4.95 LAV; book 11 escapes up to `MAX_QUANT`).
+/// sign bits + escape sequences, counted tuple by tuple by
+/// [`crate::spectral_data::tuple_bits`], which the tuple writer's
+/// differential test holds to the wire. `None` when the book cannot
+/// carry the band (a magnitude beyond the book's Table 4.95 LAV;
+/// book 11 escapes up to `MAX_QUANT`) or the band is not a whole
+/// number of tuples.
 fn band_bits(cb: u8, coeffs: &[i32]) -> Option<u32> {
     let row = crate::spectral_codebook::table_4_95(cb).ok()?;
     let dim = row.dimension? as usize;
-    let mut bw = BitWriter::new();
-    let mut k = 0;
-    while k + dim <= coeffs.len() {
-        crate::spectral_data::write_tuple(&mut bw, cb, dim, &coeffs[k..k + dim]).ok()?;
-        k += dim;
+    if !coeffs.len().is_multiple_of(dim) {
+        return None;
     }
-    if k != coeffs.len() {
-        return None; // band width not a whole number of tuples
+    let mut bits = 0u32;
+    for tuple in coeffs.chunks_exact(dim) {
+        bits += crate::spectral_data::tuple_bits(cb, dim, tuple).ok()?;
     }
-    Some(bw.bit_position() as u32)
+    Some(bits)
 }
 
 /// The §4.4.2.7-adjacent `section_data()` header cost of one section
