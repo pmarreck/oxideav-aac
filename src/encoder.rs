@@ -953,18 +953,30 @@ impl StreamEncoder {
             .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
             .sum();
         let budget = self.config.frame_budget_bytes().max(fill_bytes + 16);
+        // The frame's loudest full-range coefficient anchors every
+        // full-range channel's masking spread (see
+        // `assemble_raw_block`); an LFE keeps its own anchor.
+        let frame_peak = spectra
+            .iter()
+            .zip(self.lfe_slot.iter())
+            .filter(|(_, lfe)| !**lfe)
+            .flat_map(|(spec, _)| spec.iter())
+            .fold(0.0f64, |m, &v| m.max(v.abs()));
         let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
+        let mut raw_block =
+            self.assemble_raw_block(seq, &spectra, &tns, sf_offset, frame_peak, fills)?;
         let mut iterations = 0usize;
         if raw_block.len() > budget {
             while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
                 sf_offset += 4;
-                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
+                raw_block =
+                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset, frame_peak, fills)?;
                 iterations += 1;
             }
         } else {
             while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, fills)?;
+                let finer =
+                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, frame_peak, fills)?;
                 if finer.len() > budget {
                     break;
                 }
@@ -979,7 +991,14 @@ impl StreamEncoder {
         // once). Try the intermediate offsets, finest first.
         if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
             for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine, fills)?;
+                let cand = self.assemble_raw_block(
+                    seq,
+                    &spectra,
+                    &tns,
+                    sf_offset - fine,
+                    frame_peak,
+                    fills,
+                )?;
                 if cand.len() <= budget {
                     raw_block = cand;
                     break;
@@ -1019,12 +1038,26 @@ impl StreamEncoder {
     /// they land in each channel's `tns_data_present` / `tns_data`
     /// wire slots. Element instance tags count up per element kind,
     /// so the decoder's per-`(id, tag)` state slots stay distinct.
+    ///
+    /// `frame_peak` is the loudest coefficient over the frame's
+    /// full-range channels: every SCE and CPE judges its bands'
+    /// masking spread against it, the way the two channels of a pair
+    /// already judge theirs against the pair's peak, so a quiet
+    /// speaker (room tone 35 dB under the dialogue in a film mix)
+    /// takes the precision its level warrants and the loud one keeps
+    /// the rate. Judged each against its own peak, six channels at
+    /// equal precision cost the loud channel some 6 dB (measured:
+    /// a 5.1 film excerpt's center at 15 dB against 38 dB from a
+    /// reference encoder at the same rate). The LFE, band-limited
+    /// and independent, keeps its own anchor.
+    #[allow(clippy::too_many_arguments)]
     fn assemble_raw_block(
         &self,
         seq: WindowSequence,
         spectra: &[Vec<f64>],
         tns: &[Option<TnsData>],
         sf_offset: i32,
+        frame_peak: f64,
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
@@ -1040,7 +1073,14 @@ impl StreamEncoder {
                 ElementPlan::Sce(ch) => {
                     asm.push_channel_header(IdSynEle::Sce, sce_tag)?;
                     sce_tag += 1;
-                    self.assemble_sce(&mut body_bits, &spectra[ch], &tns[ch], seq, sf_offset)?;
+                    self.assemble_sce(
+                        &mut body_bits,
+                        &spectra[ch],
+                        &tns[ch],
+                        seq,
+                        sf_offset,
+                        frame_peak,
+                    )?;
                 }
                 ElementPlan::Lfe(ch) => {
                     asm.push_channel_header(IdSynEle::Lfe, lfe_tag)?;
@@ -1058,6 +1098,7 @@ impl StreamEncoder {
                         &tns[r],
                         seq,
                         sf_offset,
+                        frame_peak,
                     )?;
                 }
             }
@@ -1107,13 +1148,14 @@ impl StreamEncoder {
         tns: &Option<TnsData>,
         seq: WindowSequence,
         sf_offset: i32,
+        frame_peak: f64,
     ) -> Result<()> {
         // §4.6.13 PNS emission is opt-in (set_pns) and long-frame
         // only; a lone channel grants a blanket per-band allowance
         // (the noise-likeness test in quantize_group decides).
         let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
         let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
-        let peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let peak = spec.iter().fold(frame_peak, |m, &v| m.max(v.abs()));
         let pns_bands = if pns_long {
             vec![true; num_swb_long]
         } else {
@@ -1171,6 +1213,7 @@ impl StreamEncoder {
         tns_r: &Option<TnsData>,
         seq: WindowSequence,
         sf_offset: i32,
+        frame_peak: f64,
     ) -> Result<()> {
         let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
         // §4.6.8.2: per-band intensity decision first (opt-in,
@@ -1225,7 +1268,7 @@ impl StreamEncoder {
             let pair_peak = code_l
                 .iter()
                 .chain(code_r.iter())
-                .fold(0.0f64, |m, &v| m.max(v.abs()));
+                .fold(frame_peak, |m, &v| m.max(v.abs()));
             left = quantize_channel_short_grouped(
                 &code_l,
                 self.fs_index,
@@ -1274,7 +1317,7 @@ impl StreamEncoder {
             let pair_peak = code_l
                 .iter()
                 .chain(code_r.iter())
-                .fold(0.0f64, |m, &v| m.max(v.abs()));
+                .fold(frame_peak, |m, &v| m.max(v.abs()));
             left = self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?;
             right =
                 self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?;

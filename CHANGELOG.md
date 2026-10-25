@@ -8,6 +8,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Every full-range channel element of a frame judges its bands' masking
+  spread against the frame's loudest coefficient, the way the two
+  channels of a pair already judged theirs against the pair's peak,
+  instead of against its own peak. Judged each against its own, six
+  channels got equal precision whatever their level, and a film mix's
+  one loud speaker paid for the room tone on the other four: a 5.1
+  excerpt's center read 15 dB SNR against 38 dB from a reference
+  encoder at the same rate. The LFE keeps its own anchor.
 - `forward_mdct` / `imdct` run in `O(N log N)` through a DCT-IV on an
   `N/4`-point FFT instead of the direct `O(N²)` sums, which had every
   encode and decode spending its time in `cos` (a 5.1 encode ran at a
