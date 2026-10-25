@@ -1046,10 +1046,11 @@ impl StreamEncoder {
     /// speaker (room tone 35 dB under the dialogue in a film mix)
     /// takes the precision its level warrants and the loud one keeps
     /// the rate. Judged each against its own peak, six channels at
-    /// equal precision cost the loud channel some 6 dB (measured:
-    /// a 5.1 film excerpt's center at 15 dB against 38 dB from a
-    /// reference encoder at the same rate). The LFE, band-limited
-    /// and independent, keeps its own anchor.
+    /// equal precision starved the loud one: on a 5.1 film excerpt at
+    /// 6 x 96 kbit/s this anchor takes the center from 33 dB SNR to
+    /// 54 (a reference encoder reads 42) while the room-tone channels
+    /// go from 30 to 26-28 dB (the reference reads 27-29). The LFE,
+    /// band-limited and independent, keeps its own anchor.
     #[allow(clippy::too_many_arguments)]
     fn assemble_raw_block(
         &self,
