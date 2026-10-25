@@ -213,15 +213,20 @@ const SPREAD: f64 = 0.5;
 /// relative to the frame and is sent as `ZERO_HCB`.
 const MIN_TARGET_MAG: f64 = 0.7;
 
-/// Upper bound on rate-loop iterations. Each iteration coarsens
-/// every quantizer by 3 dB (sf offset +4), so 48 iterations span
-/// ~144 dB — beyond that the frame is all-zero anyway.
-const MAX_RATE_ITERATIONS: usize = 48;
+/// Coarsest scalefactor offset the rate search reaches: 48 steps
+/// of 3 dB (sf offset +4 each) span ~144 dB — beyond that the frame
+/// is all-zero anyway. A frame that still overflows there is
+/// emitted over budget.
+const MAX_SF_OFFSET: i32 = 192;
 
-/// Deepest refinement the rate loop applies when a frame comes in
+/// Deepest refinement the rate search applies when a frame comes in
 /// under budget: −32 scalefactors ≈ 24 dB of extra precision
 /// (magnitudes ×2^6 over the [`TARGET_PEAK_MAG`] baseline).
-const MAX_REFINE_OFFSET: i32 = 32;
+const MIN_SF_OFFSET: i32 = -32;
+
+/// One end of the rate search's bracket: a scalefactor offset and
+/// the raw data block assembled at it.
+type Bracket = Option<(i32, Vec<u8>)>;
 
 /// Default coded bandwidth per bit of channel rate: the audio
 /// bandwidth kept at `bitrate / channels` bits per second per
@@ -566,6 +571,12 @@ pub struct StreamEncoder {
     /// history hop, so this frame *must* be `EIGHT_SHORT_SEQUENCE`
     /// (the `LONG_START → EIGHT_SHORT` contract).
     short_pending: bool,
+    /// The previous frame's scalefactor offset, where the next
+    /// frame's rate search starts (see [`Self::search_offset`]).
+    sf_offset_hint: i32,
+    /// Raw data blocks the rate search has assembled so far — see
+    /// [`Self::rate_passes`].
+    rate_passes: u64,
     /// §4.6.13 PNS emission toggle — see [`StreamEncoder::set_pns`].
     pns_enabled: bool,
     /// §4.6.9 TNS emission toggle — see [`StreamEncoder::set_tns`].
@@ -668,6 +679,8 @@ impl StreamEncoder {
             history: vec![vec![0.0; FRAME_LEN]; ch],
             prev_seq: WindowSequence::OnlyLong,
             short_pending: false,
+            sf_offset_hint: 0,
+            rate_passes: 0,
             pns_enabled: false,
             tns_enabled: true,
             is_enabled: false,
@@ -757,6 +770,14 @@ impl StreamEncoder {
     /// transparent transcodes.
     pub fn set_intensity_stereo(&mut self, enabled: bool) {
         self.is_enabled = enabled;
+    }
+
+    /// Raw data blocks the rate search has assembled over the stream
+    /// so far. Each is a complete quantize-and-price pass over every
+    /// channel, so passes per frame is the encoder's cost; a steady
+    /// signal settles in about two per frame.
+    pub fn rate_passes(&self) -> u64 {
+        self.rate_passes
     }
 
     /// The configuration this encoder was built with.
@@ -932,12 +953,10 @@ impl StreamEncoder {
             }
         }
 
-        // Rate loop: uniform scalefactor offset in ±4 steps (3 dB
-        // per step on the §4.6.2.3.3 quarter-step ladder). Coarsen
-        // until the raw data block fits the budget; when it already
-        // fits, refine (spend the remaining budget on precision) as
-        // long as the finer frame still fits, down to
-        // `-MAX_REFINE_OFFSET`.
+        // Rate search: one uniform scalefactor offset for the frame
+        // (¾ dB per step on the §4.6.2.3.3 quarter-step ladder), the
+        // least that fits the budget, found from the previous frame's
+        // answer (see `search_offset`).
         // Fill elements ride inside the assembled raw data block, so
         // the block is priced against the whole frame budget; the
         // floor only guarantees the channel elements a minimal
@@ -962,53 +981,21 @@ impl StreamEncoder {
             .filter(|(_, lfe)| !**lfe)
             .flat_map(|(spec, _)| spec.iter())
             .fold(0.0f64, |m, &v| m.max(v.abs()));
-        let mut sf_offset = 0i32;
-        let mut raw_block =
-            self.assemble_raw_block(seq, &spectra, &tns, sf_offset, frame_peak, fills)?;
-        let mut iterations = 0usize;
-        if raw_block.len() > budget {
-            while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
-                sf_offset += 4;
-                raw_block =
-                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset, frame_peak, fills)?;
-                iterations += 1;
-            }
-        } else {
-            while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer =
-                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, frame_peak, fills)?;
-                if finer.len() > budget {
-                    break;
-                }
-                sf_offset -= 4;
-                raw_block = finer;
-                iterations += 1;
-            }
-        }
-        // Fine pass: the ±4 ladder can leave up to 3 scalefactors of
-        // precision unspent at the budget boundary (a full −4 step
-        // un-zeros a whole swath of near-threshold coefficients at
-        // once). Try the intermediate offsets, finest first.
-        if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
-            for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(
-                    seq,
-                    &spectra,
-                    &tns,
-                    sf_offset - fine,
-                    frame_peak,
-                    fills,
-                )?;
-                if cand.len() <= budget {
-                    raw_block = cand;
-                    break;
-                }
-            }
-        }
+        let (sf_offset, raw_block, passes) = self.search_offset(
+            seq,
+            &spectra,
+            &tns,
+            frame_peak,
+            fills,
+            budget,
+            self.sf_offset_hint,
+        )?;
+        self.sf_offset_hint = sf_offset;
+        self.rate_passes += passes;
 
         // ADTS wrap. aac_frame_length is 13 bits; the budget floor
-        // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
-        // every realistic configuration, but validate regardless.
+        // (16 bytes) and MAX_SF_OFFSET guarantee headroom for every
+        // realistic configuration, but validate regardless.
         let frame_len = ADTS_HEADER_BYTES_NO_CRC + raw_block.len();
         if frame_len >= (1 << 13) {
             return Err(Error::EncoderFrameOverflow);
@@ -1052,6 +1039,100 @@ impl StreamEncoder {
     /// go from 30 to 26-28 dB (the reference reads 27-29). The LFE,
     /// band-limited and independent, keeps its own anchor.
     #[allow(clippy::too_many_arguments)]
+    /// The least scalefactor offset whose raw data block fits
+    /// `budget`, with that block. Bits fall as the offset rises (each
+    /// step coarsens every quantizer by ¾ dB), so the fit boundary is
+    /// a threshold: the search confirms or refutes `hint` (the
+    /// previous frame's answer), gallops away from it in doubling
+    /// steps until the boundary is bracketed, then bisects. A steady
+    /// signal costs two passes per frame (the hint fits, the next
+    /// finer offset does not); a boundary that moved by `d` costs
+    /// about `2·log2(d)` more. The search stays within
+    /// [`MIN_SF_OFFSET`, `MAX_SF_OFFSET`]; a frame that overflows even
+    /// at the top returns that block over budget. Also returns the
+    /// number of blocks assembled.
+    #[allow(clippy::too_many_arguments)]
+    fn search_offset(
+        &self,
+        seq: WindowSequence,
+        spectra: &[Vec<f64>],
+        tns: &[Option<TnsData>],
+        frame_peak: f64,
+        fills: &[Vec<u8>],
+        budget: usize,
+        hint: i32,
+    ) -> Result<(i32, Vec<u8>, u64)> {
+        let mut passes = 0u64;
+        let mut assemble = |offset: i32| -> Result<(bool, Vec<u8>)> {
+            passes += 1;
+            let block = self.assemble_raw_block(seq, spectra, tns, offset, frame_peak, fills)?;
+            let fits = block.len() <= budget;
+            Ok((fits, block))
+        };
+        let start = hint.clamp(MIN_SF_OFFSET, MAX_SF_OFFSET);
+        let (fits, block) = assemble(start)?;
+        // `fit`: the least offset known to fit; `fail`: the greatest
+        // known not to. Each with its block.
+        let (mut fit, mut fail): (Bracket, Bracket) = if fits {
+            (Some((start, block)), None)
+        } else {
+            (None, Some((start, block)))
+        };
+        let mut step = 1i32;
+        if fits {
+            loop {
+                let lo = fit.as_ref().map_or(start, |(o, _)| *o);
+                if lo <= MIN_SF_OFFSET {
+                    break;
+                }
+                let probe = (lo - step).max(MIN_SF_OFFSET);
+                let (ok, block) = assemble(probe)?;
+                if ok {
+                    fit = Some((probe, block));
+                    step *= 2;
+                } else {
+                    fail = Some((probe, block));
+                    break;
+                }
+            }
+        } else {
+            loop {
+                let hi = fail.as_ref().map_or(start, |(o, _)| *o);
+                if hi >= MAX_SF_OFFSET {
+                    break;
+                }
+                let probe = (hi + step).min(MAX_SF_OFFSET);
+                let (ok, block) = assemble(probe)?;
+                if ok {
+                    fit = Some((probe, block));
+                    break;
+                } else {
+                    fail = Some((probe, block));
+                    step *= 2;
+                }
+            }
+        }
+        while let (Some(lo), Some(hi)) = (
+            fit.as_ref().map(|(o, _)| *o),
+            fail.as_ref().map(|(o, _)| *o),
+        ) {
+            if lo - hi <= 1 {
+                break;
+            }
+            let mid = hi + (lo - hi) / 2;
+            let (ok, block) = assemble(mid)?;
+            if ok {
+                fit = Some((mid, block));
+            } else {
+                fail = Some((mid, block));
+            }
+        }
+        let (offset, block) = fit
+            .or(fail)
+            .expect("the rate search assembled at least one block");
+        Ok((offset, block, passes))
+    }
+
     fn assemble_raw_block(
         &self,
         seq: WindowSequence,

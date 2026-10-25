@@ -122,8 +122,8 @@ use crate::spectrum_huffman::{
     hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write, hcod3_decode,
     hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write, hcod5_decode, hcod5_encode,
     hcod5_write, hcod6_decode, hcod6_encode, hcod6_write, hcod7_decode, hcod7_encode, hcod7_write,
-    hcod8_decode, hcod8_encode, hcod8_write, hcod9_decode, hcod9_encode, hcod9_write, hcod10_decode,
-    hcod10_encode, hcod10_write, hcod11_decode, hcod11_encode, hcod11_write,
+    hcod8_decode, hcod8_encode, hcod8_write, hcod9_decode, hcod9_encode, hcod9_write,
+    hcod10_decode, hcod10_encode, hcod10_write, hcod11_decode, hcod11_encode, hcod11_write,
 };
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
